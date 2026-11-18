@@ -1,0 +1,39 @@
+{
+  // Cloudflare Worker name and the server entry point used for deployment.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "testingmind-projectpilot",
+  "main": "src/server.ts",
+  "compatibility_date": "2026-10-30",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  // Expose the Workers AI service to the Worker as `env.AI`.
+  "ai": {
+    "binding": "AI",
+    "remote": true
+  },
+  "assets": {
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/agents/*"
+    ]
+  },
+  // Register ChatAgent as a named Durable Object class with SQLite storage.
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "ChatAgent",
+        "name": "ChatAgent"
+      }
+    ]
+  },
+  // Migrations tell Cloudflare when a new Durable Object class is introduced.
+  "migrations": [
+    {
+      "new_sqlite_classes": [
+        "ChatAgent"
+      ],
+      "tag": "v1"
+    }
+  ]
+}

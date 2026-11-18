@@ -1,0 +1,16 @@
+{
+  "extends": "agents/tsconfig",
+  "compilerOptions": {
+    "types": [
+      "node",
+      "./worker-configuration.d.ts",
+      "vite/client"
+    ],
+    "noEmit": true
+  },
+  "include": [
+    "src",
+    "worker-configuration.d.ts",
+    "vite.config.ts"
+  ]
+}
