@@ -9,12 +9,13 @@ const app = readFileSync(new URL("../src/app.tsx", import.meta.url), "utf8");
 // someone adds a write tool without an approval gate or moves persistence outside it.
 test("every exposed write tool requires approval before execute", () => {
   const writeTools = ["createProject", "createBacklogItems", "draftSprintPlan"];
+  // Verify tool uses needsApproval: true (deprecated but avoids secret issues)
   for (const name of writeTools) {
     const start = server.indexOf(`${name}: tool({`);
     assert.notEqual(start, -1, `Expected ${name} to be exposed as a tool`);
     const nextTool = server.indexOf("\n\n        ", start + 1);
     const block = server.slice(start, nextTool === -1 ? server.length : nextTool);
-    assert.match(block, /needsApproval:\s*true/, `${name} must require approval`);
+    assert.match(block, /needsApproval:\s*true/, `${name} must require approval via needsApproval: true`);
     assert.ok(block.indexOf("needsApproval: true") < block.indexOf("execute:"), `${name} approval must be declared before its execute handler`);
   }
 });

@@ -274,7 +274,7 @@ export default function App() {
   // useAgentChat manages the approval protocol and the resumed server turn.
   // Its terminal callback provides a second synchronization point: after the
   // approval continuation has ended, inspect the final transcript for writes.
-  const { messages, sendMessage, addToolApprovalResponse, status } = useAgentChat({
+  const { messages, sendMessage, addToolApprovalResponse, clearHistory, status, stop } = useAgentChat({
     agent,
     autoContinueAfterToolResult: true,
     onTurnEnd: ({ outcome, error }) => {
@@ -403,6 +403,12 @@ export default function App() {
           <span>Target: {formatDate(board.project?.targetDate)}</span>
           <button className="refresh-button" onClick={() => void refreshBoard()} disabled={boardLoading}>
             {boardLoading ? "Refreshing…" : "↻ Refresh"}
+          </button>
+          <button
+              className="refresh-button"
+              onClick={clearHistory}
+            >
+              Clear
           </button>
         </div>
       </section>
@@ -718,7 +724,11 @@ export default function App() {
               rows={2}
               aria-label="Message ProjectPilot"
             />
-            <button type="submit" disabled={!input.trim() || isChatBusy}>↑</button>
+            {status === "streaming" ? (
+              <button type="button" className="stop-button" onClick={() => stop()} aria-label="Stop generation">■ Stop</button>
+            ) : (
+              <button type="submit" disabled={!input.trim() || isChatBusy}>↑</button>
+            )}
           </form>
           <div className="agent-panel-footnote"><span>◇</span> Every create action requires your approval before it writes to SQLite.</div>
         </aside>

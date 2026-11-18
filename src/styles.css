@@ -282,6 +282,8 @@ button { cursor: pointer; }
 .agent-composer textarea:focus { border-color: #83bbb2; box-shadow: 0 0 0 3px rgba(49,145,137,.08); }
 .agent-composer button { width: 35px; height: 35px; border: 0; border-radius: 8px; color: white; background: #1e6870; font-size: 17px; }
 .agent-composer button:disabled { opacity: .45; cursor: not-allowed; }
+.agent-composer .stop-button { background: #c44d4d; width: auto; padding: 0 14px; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+.agent-composer .stop-button:hover { background: #a83d3d; }
 .agent-panel-footnote { display: flex; align-items: center; gap: 6px; padding: 0 13px 12px; color: #81978e; font-size: 8px; }
 .agent-panel-footnote span { color: #3b8b79; }
 .footer { padding-top: 14px; }
