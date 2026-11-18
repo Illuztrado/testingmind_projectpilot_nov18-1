@@ -10,62 +10,6 @@ import {
   useAgentChat
 } from "@cloudflare/ai-chat/react";
 
-// Toast notification system
-type ToastType = "success" | "error" | "warning" | "info";
-
-interface Toast {
-  id: string;
-  type: ToastType;
-  title: string;
-  message?: string;
-  duration?: number;
-}
-
-function useToast() {
-  const [toasts, setToasts] = useState<Toast[]>([]);
-
-  const addToast = (toast: Omit<Toast, "id">) => {
-    const id = crypto.randomUUID();
-    const duration = toast.duration ?? (toast.type === "error" ? 8000 : 4000);
-    setToasts((prev) => [...prev, { ...toast, id, duration }]);
-    if (duration > 0) {
-      setTimeout(() => {
-        setToasts((prev) => prev.filter((t) => t.id !== id));
-      }, duration);
-    }
-  };
-
-  const removeToast = (id: string) => {
-    setToasts((prev) => prev.filter((t) => t.id !== id));
-  };
-
-  return { toasts, addToast, removeToast };
-}
-
-// Toast container component
-function ToastContainer({ toasts, onRemove }: { toasts: Toast[]; onRemove: (id: string) => void }) {
-  if (toasts.length === 0) return null;
-  return (
-    <div className="toast-container" aria-live="polite" aria-atomic="true">
-      {toasts.map((toast) => (
-        <div key={toast.id} className={`toast toast-${toast.type}`} role="alert">
-          <div className="toast-icon">
-            {toast.type === "success" && "✓"}
-            {toast.type === "error" && "✕"}
-            {toast.type === "warning" && "⚠"}
-            {toast.type === "info" && "ℹ"}
-          </div>
-          <div className="toast-content">
-            <strong>{toast.title}</strong>
-            {toast.message && <p>{toast.message}</p>}
-          </div>
-          <button className="toast-close" onClick={() => onRemove(toast.id)} aria-label="Dismiss">×</button>
-        </div>
-      ))}
-    </div>
-  );
-}
-
 // Frontend view models mirror the safe, serializable data returned by the server.
 // They are not database entities; the server remains the source of truth.
 // The types below describe the shape of data the server sends to the screen.
@@ -233,15 +177,12 @@ export default function App() {
   // project-selection effect for that programmatic change because this refresh
   // already loaded the board (and may carry a preferred newly-created sprint).
   const skipSelectionRefreshRef = useRef<{ pending: boolean; projectId?: string }>({ pending: false });
-  // Toast notifications for user feedback
-  const { toasts, addToast, removeToast } = useToast();
 
   // Load the project board through the read-only callable RPC. This is
   // called after the initial load, project changes, and successful approved writes.
   async function refreshBoard(
     projectId: string | undefined = selectedProjectId,
-    preferredSprintId?: string,
-    showToast = false
+    preferredSprintId?: string
   ) {
     const requestId = ++boardRequestSequence.current;
     setBoardLoading(true);
@@ -268,16 +209,9 @@ export default function App() {
           ? current
           : next.sprints[0]?.id;
       });
-      if (showToast) {
-        addToast({ type: "success", title: "Workspace updated", message: "Latest changes have been loaded." });
-      }
     } catch (error: unknown) {
       if (requestId === boardRequestSequence.current) {
-        const message = error instanceof Error ? error.message : "Unable to load the project workspace.";
-        setBoardError(message);
-        if (showToast) {
-          addToast({ type: "error", title: "Refresh failed", message, duration: 10000 });
-        }
+        setBoardError(error instanceof Error ? error.message : "Unable to load the project workspace.");
       }
     } finally {
       if (requestId === boardRequestSequence.current) setBoardLoading(false);
@@ -313,11 +247,7 @@ export default function App() {
         refreshedWriteToolCalls.current.add(toolCallId);
 
         const input = getToolInput(part) as { projectId?: string } | undefined;
-        const output = getToolOutput(part) as 
-          | { id?: string; projectId?: string; persisted?: boolean }
-          | { id: string; name: string; projectId: string; createdCount?: number; items?: Array<{ id: string }>; persisted: boolean }
-          | { id: string; name: string; projectId: string; goal: string; capacityPoints: number; plannedPoints: number; persisted: boolean }
-          | undefined;
+        const output = getToolOutput(part) as { id?: string; projectId?: string; persisted?: boolean } | undefined;
         // A completed tool part is not enough on its own: require the explicit
         // persistence acknowledgement returned after the SQLite INSERT succeeds.
         if (output?.persisted !== true) continue;
@@ -330,20 +260,13 @@ export default function App() {
           setBacklogSearch("");
           setPriorityFilter("all");
           setStatusFilter("all");
-          const createdCount = "createdCount" in (output ?? {}) ? (output as any).createdCount : "items" in (output ?? {}) ? (output as any).items?.length : "New";
-          addToast({ type: "success", title: "Backlog created", message: `${createdCount} items added to backlog.` });
         } else if (toolName === "draftSprintPlan") {
           setActiveTab("sprint");
-          const sprintName = "name" in (output ?? {}) ? (output as any).name : "created";
-          addToast({ type: "success", title: "Sprint planned", message: `Draft sprint "${sprintName}" saved.` });
-        } else if (toolName === "createProject") {
-          const projectName = "name" in (output ?? {}) ? (output as any).name : "New project";
-          addToast({ type: "success", title: "Project created", message: `"${projectName}" is ready.` });
         }
 
         // The tool output is emitted only after its approval-gated execute()
         // handler has successfully inserted the records into SQLite.
-        void refreshBoard(targetProjectId, preferredSprintId, true);
+        void refreshBoard(targetProjectId, preferredSprintId);
       }
     }
   }
@@ -351,7 +274,7 @@ export default function App() {
   // useAgentChat manages the approval protocol and the resumed server turn.
   // Its terminal callback provides a second synchronization point: after the
   // approval continuation has ended, inspect the final transcript for writes.
-  const { messages, sendMessage, clearHistory, addToolApprovalResponse, status } = useAgentChat({
+  const { messages, sendMessage, addToolApprovalResponse, status } = useAgentChat({
     agent,
     autoContinueAfterToolResult: true,
     onTurnEnd: ({ outcome, error }) => {
@@ -443,7 +366,6 @@ export default function App() {
 
   return (
     <main className="shell app-shell">
-      <ToastContainer toasts={toasts} onRemove={removeToast} />
       <header className="topbar">
         <div className="brand-mark">PP</div>
         <div className="brand-copy">
@@ -482,14 +404,6 @@ export default function App() {
           <button className="refresh-button" onClick={() => void refreshBoard()} disabled={boardLoading}>
             {boardLoading ? "Refreshing…" : "↻ Refresh"}
           </button>
-          <button
-              // variant="secondary"
-              // icon={<TrashIcon size={16} />}
-              className="refresh-button"
-              onClick={clearHistory}
-            >
-              Clear
-            </button>
         </div>
       </section>
 
@@ -748,8 +662,8 @@ export default function App() {
                         <p>This operation will add records to your project workspace. Nothing is saved until you approve.</p>
                         <details className="approval-payload"><summary>Review exact proposed data</summary><pre>{pretty(getToolInput(part))}</pre></details>
                         <div className="approval-buttons">
-                          <button type="button" className="approve-button" onClick={() => { addToolApprovalResponse({ id: approvalId, approved: true }); addToast({ type: "info", title: "Approval submitted", message: `Saving ${actionLabel(toolName).toLowerCase()}...` }); }}>Approve & save</button>
-                          <button type="button" className="reject-button" onClick={() => { addToolApprovalResponse({ id: approvalId, approved: false }); addToast({ type: "warning", title: "Action rejected", message: `${actionLabel(toolName)} was cancelled.` }); }}>Reject</button>
+                          <button type="button" className="approve-button" onClick={() => addToolApprovalResponse({ id: approvalId, approved: true })}>Approve & save</button>
+                          <button type="button" className="reject-button" onClick={() => addToolApprovalResponse({ id: approvalId, approved: false })}>Reject</button>
                         </div>
                       </div>
                     );
@@ -778,10 +692,7 @@ export default function App() {
                       </div>
                     );
                   }
-                  if (toolState === "denied" || ("state" in part && part.state === "output-denied")) {
-                    // Show a toast for rejected actions (in case not already shown via button click)
-                    return <p className="chat-tool-denied" key={toolCallId}>Action rejected. No project data was changed.</p>;
-                  }
+                  if (toolState === "denied" || ("state" in part && part.state === "output-denied")) return <p className="chat-tool-denied" key={toolCallId}>Action rejected. No project data was changed.</p>;
                   return null;
                 })}
               </article>

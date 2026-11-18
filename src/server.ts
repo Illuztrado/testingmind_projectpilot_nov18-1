@@ -4,7 +4,6 @@ import { createAI } from "agents/models/ai-sdk";
 import { convertToModelMessages, pruneMessages, stepCountIs, streamText, tool } from "ai";
 import { z } from "zod";
 import { evaluateSprintSelection } from "./project-utils";
-import { createScopedLogger, type LogLevel } from "./logger";
 
 // SYSTEM PROMPT = the agent's operating instructions.
 // This text tells the LLM which jobs it may do, which tools it can use, and
@@ -22,9 +21,9 @@ WORKFLOW
 - Never persist a project, backlog item, or sprint until the user sees and explicitly approves the relevant tool call in the app's approval card.
 - The tools createProject, createBacklogItems, and draftSprintPlan all require human approval. Never ask the user to bypass or work around that approval. If approval is rejected, do not retry that write or make a similar write with altered inputs unless the user explicitly makes a new request.
 - Use listBacklog to ground sprint selection in saved work. If capacity is missing, ask for it. Never invent team capacity, owners, commitments, story point estimates as agreed facts, or dates.
-- When creating a project, include 3–6 phased deliverables. Each deliverable must have a phase, a concise title, and a verifiable outcome. Persist these deliverables with the project so they remain visible in the workspace.
+- When creating a project, include only 1-2 phased deliverables. Each deliverable must have a phase, a concise title, and a verifiable outcome. Persist these deliverables with the project so they remain visible in the workspace.
 - For backlog decomposition, trace epics, stories and tasks back to the saved deliverables. Create actionable, independently verifiable work items. Include acceptance criteria where useful. Set AI-suggested story points as estimates and clearly label them as suggestions.
-- **Limit backlog output to a single Epic (with its child stories/tasks).** This keeps the approval card focused and reviewable.
+- **Limit backlog output to only one  Epic (with its child stories/tasks). Limit stories to only 2 per epic. Limit tasks to 2 per story.** This keeps the approval card focused and reviewable.
 - A sprint is only a proposal and is saved as status 'draft'. It is not a team commitment or a baseline. Flag over-capacity selections, unestimated items, and unfinished or missing dependencies.
 - **Limit sprint proposals to exactly one sprint.** Do not propose multiple sprints in a single call.
 - Read tools may run without approval. Every tool that adds, changes, or deletes persisted project data must require explicit human approval before execution. Do not claim that a write happened until the tool completes successfully.
@@ -111,12 +110,10 @@ export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 80;
   private readonly aiBinding: Ai;
   private schemaReady = false;
-  private readonly log = createScopedLogger({ workspace: "ChatAgent" });
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.aiBinding = env.AI;
-    this.log.info("ChatAgent initialized", { durableObjectId: ctx.id.toString() });
   }
 
   // Create the application's data tables the first time this Durable Object
@@ -124,7 +121,7 @@ export class ChatAgent extends AIChatAgent<Env> {
   // chat messages are persisted separately by AIChatAgent.
   private ensureSchema(): void {
     if (this.schemaReady) return;
-    this.log.debug("Creating database schema if not exists");
+
     this.sql`
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
@@ -180,12 +177,10 @@ export class ChatAgent extends AIChatAgent<Env> {
     // deliverables column. Add it only when it is missing, preserving old rows.
     const projectColumns = this.sql<{ name: string }>`PRAGMA table_info(projects)`;
     if (!projectColumns.some((column) => column.name === "deliverables")) {
-      this.log.info("Running schema migration: adding deliverables column to projects");
       this.sql`ALTER TABLE projects ADD COLUMN deliverables TEXT NOT NULL DEFAULT '[]'`;
     }
     this.sql`CREATE INDEX IF NOT EXISTS idx_work_items_project ON work_items(project_id)`;
     this.schemaReady = true;
-    this.log.info("Database schema ready");
   }
 
   // Small query helpers keep SQL in one place and make the tools easier to read.
@@ -213,81 +208,76 @@ export class ChatAgent extends AIChatAgent<Env> {
   @callable()
   async getWorkspaceBoard(projectId?: string) {
     this.ensureSchema();
-    const boardLog = this.log.withToolLogging("getWorkspaceBoard", async () => {
-      const projectRows = this.sql<ProjectRow>`SELECT * FROM projects ORDER BY updated_at DESC LIMIT 30`;
-      const selectedId = projectId && projectRows.some((project) => project.id === projectId)
-        ? projectId
-        : projectRows[0]?.id ?? null;
-      const selectedProject = selectedId ? this.getProject(selectedId) : undefined;
+    const projectRows = this.sql<ProjectRow>`SELECT * FROM projects ORDER BY updated_at DESC LIMIT 30`;
+    const selectedId = projectId && projectRows.some((project) => project.id === projectId)
+      ? projectId
+      : projectRows[0]?.id ?? null;
+    const selectedProject = selectedId ? this.getProject(selectedId) : undefined;
 
-      if (!selectedProject) {
-        this.log.debug("No project selected, returning empty board");
-        return { projects: projectRows.map((project) => ({
-          id: project.id, name: project.name, objective: project.objective,
-          deliverables: parseJson<Array<{ phase: string; title: string; outcome: string }>>(project.deliverables, []),
-          status: project.status, targetDate: project.target_date
-        })), selectedProjectId: null, project: null, backlog: [], sprints: [] };
-      }
+    if (!selectedProject) {
+      return { projects: projectRows.map((project) => ({
+        id: project.id, name: project.name, objective: project.objective,
+        deliverables: parseJson<Array<{ phase: string; title: string; outcome: string }>>(project.deliverables, []),
+        status: project.status, targetDate: project.target_date
+      })), selectedProjectId: null, project: null, backlog: [], sprints: [] };
+    }
 
-      // Convert database rows into UI-friendly objects. JSON text columns are
-      // parsed back into arrays so React can render criteria and dependencies.
-      const backlog = this.getWorkItems(selectedProject.id).map((item) => ({
-        id: item.id, type: item.type, title: item.title, description: item.description,
-        acceptanceCriteria: parseJson<string[]>(item.acceptance_criteria, []),
-        priority: item.priority, status: item.status, estimatePoints: item.estimate_points,
-        owner: item.owner, dueDate: item.due_date,
-        dependencies: parseJson<string[]>(item.dependencies, [])
-      }));
-      const sprintRows = this.sql<{
-        id: string; project_id: string; name: string; goal: string; capacity_points: number;
-        planned_points: number; work_item_ids: string; status: string;
-        start_date: string | null; end_date: string | null; created_at: string;
-      }>`SELECT * FROM sprints WHERE project_id = ${selectedProject.id} ORDER BY created_at DESC LIMIT 20`;
-      const itemById = new Map(backlog.map((item) => [item.id, item]));
-      const sprintCandidates = backlog.map((item) => ({
-        id: item.id, title: item.title, estimatePoints: item.estimatePoints,
-        status: item.status as "backlog" | "ready" | "in_progress" | "blocked" | "done",
-        dependencies: item.dependencies
-      }));
-      // Recalculate sprint warnings from the current backlog instead of blindly
-      // trusting the values originally proposed by the LLM. Capacity and dependency
-      // checks are deterministic application logic, not model-generated claims.
-      const sprints = sprintRows.map((sprint) => {
-        const ids = parseJson<string[]>(sprint.work_item_ids, []);
-        const evaluation = evaluateSprintSelection(sprintCandidates, ids, sprint.capacity_points, sprintCandidates);
-        return {
-          id: sprint.id, name: sprint.name, goal: sprint.goal, status: sprint.status,
-          capacityPoints: sprint.capacity_points, plannedPoints: sprint.planned_points,
-          remainingCapacity: sprint.capacity_points - sprint.planned_points,
-          overCapacity: evaluation.overCapacity, overBy: evaluation.overBy,
-          unestimatedWorkItemIds: evaluation.unestimatedWorkItemIds,
-          dependencyWarnings: evaluation.dependencyWarnings,
-          unknownWorkItemIds: evaluation.unknownWorkItemIds,
-          completedWorkItemIds: evaluation.completedWorkItemIds,
-          startDate: sprint.start_date, endDate: sprint.end_date, createdAt: sprint.created_at,
-          items: ids.map((id) => itemById.get(id)).filter((item) => item !== undefined)
-        };
-      });
-
-      this.log.debug("Workspace board loaded", { projectId: selectedProject.id, backlogCount: backlog.length, sprintCount: sprints.length });
+    // Convert database rows into UI-friendly objects. JSON text columns are
+    // parsed back into arrays so React can render criteria and dependencies.
+    const backlog = this.getWorkItems(selectedProject.id).map((item) => ({
+      id: item.id, type: item.type, title: item.title, description: item.description,
+      acceptanceCriteria: parseJson<string[]>(item.acceptance_criteria, []),
+      priority: item.priority, status: item.status, estimatePoints: item.estimate_points,
+      owner: item.owner, dueDate: item.due_date,
+      dependencies: parseJson<string[]>(item.dependencies, [])
+    }));
+    const sprintRows = this.sql<{
+      id: string; project_id: string; name: string; goal: string; capacity_points: number;
+      planned_points: number; work_item_ids: string; status: string;
+      start_date: string | null; end_date: string | null; created_at: string;
+    }>`SELECT * FROM sprints WHERE project_id = ${selectedProject.id} ORDER BY created_at DESC LIMIT 20`;
+    const itemById = new Map(backlog.map((item) => [item.id, item]));
+    const sprintCandidates = backlog.map((item) => ({
+      id: item.id, title: item.title, estimatePoints: item.estimatePoints,
+      status: item.status as "backlog" | "ready" | "in_progress" | "blocked" | "done",
+      dependencies: item.dependencies
+    }));
+    // Recalculate sprint warnings from the current backlog instead of blindly
+    // trusting the values originally proposed by the LLM. Capacity and dependency
+    // checks are deterministic application logic, not model-generated claims.
+    const sprints = sprintRows.map((sprint) => {
+      const ids = parseJson<string[]>(sprint.work_item_ids, []);
+      const evaluation = evaluateSprintSelection(sprintCandidates, ids, sprint.capacity_points, sprintCandidates);
       return {
-        projects: projectRows.map((project) => ({
-          id: project.id, name: project.name, objective: project.objective,
-          status: project.status, targetDate: project.target_date
-        })),
-        selectedProjectId: selectedProject.id,
-        project: {
-          id: selectedProject.id, name: selectedProject.name, objective: selectedProject.objective,
-          status: selectedProject.status, targetDate: selectedProject.target_date,
-          scopeIn: parseJson<string[]>(selectedProject.scope_in, []),
-          scopeOut: parseJson<string[]>(selectedProject.scope_out, []),
-          deliverables: parseJson<Array<{ phase: string; title: string; outcome: string }>>(selectedProject.deliverables, [])
-        },
-        backlog,
-        sprints
+        id: sprint.id, name: sprint.name, goal: sprint.goal, status: sprint.status,
+        capacityPoints: sprint.capacity_points, plannedPoints: sprint.planned_points,
+        remainingCapacity: sprint.capacity_points - sprint.planned_points,
+        overCapacity: evaluation.overCapacity, overBy: evaluation.overBy,
+        unestimatedWorkItemIds: evaluation.unestimatedWorkItemIds,
+        dependencyWarnings: evaluation.dependencyWarnings,
+        unknownWorkItemIds: evaluation.unknownWorkItemIds,
+        completedWorkItemIds: evaluation.completedWorkItemIds,
+        startDate: sprint.start_date, endDate: sprint.end_date, createdAt: sprint.created_at,
+        items: ids.map((id) => itemById.get(id)).filter((item) => item !== undefined)
       };
-    }, { projectId });
-    return boardLog;
+    });
+
+    return {
+      projects: projectRows.map((project) => ({
+        id: project.id, name: project.name, objective: project.objective,
+        status: project.status, targetDate: project.target_date
+      })),
+      selectedProjectId: selectedProject.id,
+      project: {
+        id: selectedProject.id, name: selectedProject.name, objective: selectedProject.objective,
+        status: selectedProject.status, targetDate: selectedProject.target_date,
+        scopeIn: parseJson<string[]>(selectedProject.scope_in, []),
+        scopeOut: parseJson<string[]>(selectedProject.scope_out, []),
+        deliverables: parseJson<Array<{ phase: string; title: string; outcome: string }>>(selectedProject.deliverables, [])
+      },
+      backlog,
+      sprints
+    };
   }
 
   // This method is called when a user sends a chat message. It configures the
@@ -296,29 +286,12 @@ export class ChatAgent extends AIChatAgent<Env> {
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     this.ensureSchema();
     const ai = createAI({ binding: this.aiBinding });
-    const workspaceId = this.ctx.id.toString();
-
-    this.log.info("Chat message received", { workspaceId });
-
-    // Generate a tool approval secret for HMAC-signing approval requests.
-    // This is required for the approval flow to work with @cloudflare/ai-chat.
-    const storedSecret = await this.ctx.storage.get("tool-approval-secret");
-    const approvalSecret = (storedSecret as string) ?? crypto.randomUUID();
-    await this.ctx.storage.put("tool-approval-secret", approvalSecret);
 
     // streamText is the agent harness for this request: it sends the prompt to
     // the model, manages tool-call steps, and streams the response to the UI.
     const result = streamText({
-      // cf/meta/llama-4-scout-17b-16e-instruct
-      model: ai("@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
+      model: ai("@cf/meta/llama-4-scout-17b-16e-instruct"),
       system: systemPrompt,
-      // Allow longer responses for detailed backlog/sprint generation
-      // Note: maxTokens is passed via providerOptions for Workers AI
-      providerOptions: {
-        workersai: {
-          max_tokens: 16384,
-        },
-      },
       // Convert stored chat messages into the model's message format. Pruning
       // reduces the context sent to the LLM; it does not delete persisted history.
       messages: pruneMessages({
@@ -354,26 +327,23 @@ export class ChatAgent extends AIChatAgent<Env> {
           // execute until the user approves. Keep the SQL INSERT inside execute.
           needsApproval: true,
           execute: async ({ name, objective, deliverables, scopeIn, scopeOut, stakeholders, startDate, targetDate }) => {
-            return this.log.withToolLogging("createProject", async () => {
-              const now = new Date().toISOString();
-              const id = newId("PRJ");
-              const normalizedScopeIn = scopeIn ?? [];
-              const normalizedScopeOut = scopeOut ?? [];
-              const normalizedStakeholders = stakeholders ?? [];
-              const normalizedStartDate = normalizeOptionalDate(startDate);
-              const normalizedTargetDate = normalizeOptionalDate(targetDate);
-              try {
-                this.sql`
-                  INSERT INTO projects (id, name, objective, scope_in, scope_out, deliverables, stakeholders, status, start_date, target_date, created_at, updated_at)
-                  VALUES (${id}, ${name}, ${objective}, ${JSON.stringify(normalizedScopeIn)}, ${JSON.stringify(normalizedScopeOut)}, ${JSON.stringify(deliverables)}, ${JSON.stringify(normalizedStakeholders)}, 'planning', ${normalizedStartDate}, ${normalizedTargetDate}, ${now}, ${now})
-                `;
-              } catch (error) {
-                this.log.error("createProject INSERT failed", error instanceof Error ? error : new Error(String(error)), { projectId: id });
-                throw new Error(`Project creation failed: ${error instanceof Error ? error.message : String(error)}`);
-              }
-              this.log.approval({ toolName: "createProject", action: "completed", projectId: id, message: `Project ${name} created` });
-              return { id, name, objective, deliverables, status: "planning", startDate: normalizedStartDate, targetDate: normalizedTargetDate, scopeIn: normalizedScopeIn, scopeOut: normalizedScopeOut, stakeholders: normalizedStakeholders, persisted: true };
-            }, { input: { name, objective, deliverables, scopeIn, scopeOut, stakeholders, startDate, targetDate } });
+            const now = new Date().toISOString();
+            const id = newId("PRJ");
+            const normalizedScopeIn = scopeIn ?? [];
+            const normalizedScopeOut = scopeOut ?? [];
+            const normalizedStakeholders = stakeholders ?? [];
+            const normalizedStartDate = normalizeOptionalDate(startDate);
+            const normalizedTargetDate = normalizeOptionalDate(targetDate);
+            try {
+              this.sql`
+                INSERT INTO projects (id, name, objective, scope_in, scope_out, deliverables, stakeholders, status, start_date, target_date, created_at, updated_at)
+                VALUES (${id}, ${name}, ${objective}, ${JSON.stringify(normalizedScopeIn)}, ${JSON.stringify(normalizedScopeOut)}, ${JSON.stringify(deliverables)}, ${JSON.stringify(normalizedStakeholders)}, 'planning', ${normalizedStartDate}, ${normalizedTargetDate}, ${now}, ${now})
+              `;
+            } catch (error) {
+              console.error("[ProjectPilot] createProject failed", error);
+              throw new Error(`Project creation failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+            return { id, name, objective, deliverables, status: "planning", startDate: normalizedStartDate, targetDate: normalizedTargetDate, scopeIn: normalizedScopeIn, scopeOut: normalizedScopeOut, stakeholders: normalizedStakeholders, persisted: true };
           }
         }),
 
@@ -397,7 +367,7 @@ export class ChatAgent extends AIChatAgent<Env> {
         createBacklogItems: tool({
           // Each array entry becomes one backlog row after the whole proposed batch
           // is approved. IDs and timestamps are assigned by the server, not the LLM.
-          description: "Add a proposed set of work items for ONE epic (with its child stories/tasks) to a project's backlog. The exact items must be approved by the user before they are written. Limit: 1 epic + its stories/tasks per call.",
+           description: "Add a proposed set of work items for ONE epic (with its child stories/tasks) to a project's backlog. The exact items must be approved by the user before they are written. Limit: 1 epic + its stories/tasks per call. Limit: 2 stories per epic. Each story may have 0-2 tasks. Include acceptance criteria where useful. Set AI-suggested story points as estimates and clearly label them as suggestions.",
           inputSchema: z.object({
             projectId: projectIdSchema,
             items: z.array(z.object({
@@ -408,36 +378,33 @@ export class ChatAgent extends AIChatAgent<Env> {
               priority: z.enum(["must", "should", "could", "wont"]).nullable().optional(),
               estimatePoints: z.number().int().min(1).max(100).nullable().optional(),
               dependencies: z.array(z.string().min(1).max(100)).max(10).nullable().optional()
-            })).min(1).max(15)
+            })).min(1).max(25)
           }),
           // Nothing is inserted before approval. After approval, validate the
           // project exists, then persist the approved backlog items as a batch.
           needsApproval: true,
           execute: async ({ projectId, items }) => {
-            return this.log.withToolLogging("createBacklogItems", async () => {
-              const missing = this.projectNotFound(projectId);
-              if (missing) throw new Error(missing.error);
-              const now = new Date().toISOString();
-              const saved = items.map((item) => {
-                const id = newId("WI");
-                const acceptanceCriteria = item.acceptanceCriteria ?? [];
-                const priority = item.priority ?? "should";
-                const dependencies = item.dependencies ?? [];
-                const estimatePoints = item.estimatePoints ?? null;
-                try {
-                  this.sql`
-                    INSERT INTO work_items (id, project_id, type, title, description, acceptance_criteria, priority, status, estimate_points, owner, due_date, dependencies, created_at, updated_at)
-                    VALUES (${id}, ${projectId}, ${item.type}, ${item.title}, ${item.description}, ${JSON.stringify(acceptanceCriteria)}, ${priority}, 'backlog', ${estimatePoints}, NULL, NULL, ${JSON.stringify(dependencies)}, ${now}, ${now})
-                  `;
-                } catch (error) {
-                  this.log.error("createBacklogItems INSERT failed", error instanceof Error ? error : new Error(String(error)), { projectId, workItemId: id, title: item.title });
-                  throw new Error(`Backlog item save failed for '${item.title}': ${error instanceof Error ? error.message : String(error)}`);
-                }
-                return { id, type: item.type, title: item.title, priority, status: "backlog", estimatePoints };
-              });
-              this.log.approval({ toolName: "createBacklogItems", action: "completed", projectId, message: `Created ${saved.length} backlog items` });
-              return { projectId, createdCount: saved.length, items: saved, persisted: true };
-            }, { input: { projectId, items } });
+            const missing = this.projectNotFound(projectId);
+            if (missing) throw new Error(missing.error);
+            const now = new Date().toISOString();
+            const saved = items.map((item) => {
+              const id = newId("WI");
+              const acceptanceCriteria = item.acceptanceCriteria ?? [];
+              const priority = item.priority ?? "should";
+              const dependencies = item.dependencies ?? [];
+              const estimatePoints = item.estimatePoints ?? null;
+              try {
+                this.sql`
+                  INSERT INTO work_items (id, project_id, type, title, description, acceptance_criteria, priority, status, estimate_points, owner, due_date, dependencies, created_at, updated_at)
+                  VALUES (${id}, ${projectId}, ${item.type}, ${item.title}, ${item.description}, ${JSON.stringify(acceptanceCriteria)}, ${priority}, 'backlog', ${estimatePoints}, NULL, NULL, ${JSON.stringify(dependencies)}, ${now}, ${now})
+                `;
+              } catch (error) {
+                console.error("[ProjectPilot] createBacklogItems failed", error);
+                throw new Error(`Backlog item save failed for '${item.title}': ${error instanceof Error ? error.message : String(error)}`);
+              }
+              return { id, type: item.type, title: item.title, priority, status: "backlog", estimatePoints };
+            });
+            return { projectId, createdCount: saved.length, items: saved, persisted: true };
           }
         }),
 
@@ -463,7 +430,7 @@ export class ChatAgent extends AIChatAgent<Env> {
         draftSprintPlan: tool({
           // The model supplies selected IDs; the server looks them up again and
           // recomputes points, capacity and dependency warnings before persisting.
-          description: "Save ONE proposed sprint as a DRAFT using selected saved backlog IDs and the user's explicit team capacity. This creates a record and always requires human approval first. Flag over-capacity, unestimated work, and unfinished or missing dependencies. Never claim a draft is committed. Limit: exactly 1 sprint per call.",
+          description: "Save a proposed sprint as a DRAFT using selected saved backlog IDs and the user's explicit team capacity. This creates a record and always requires human approval first. Flag over-capacity, unestimated work, and unfinished or missing dependencies. Never claim a draft is committed.",
           inputSchema: z.object({
             projectId: projectIdSchema,
             name: z.string().min(2).max(100),
@@ -477,58 +444,45 @@ export class ChatAgent extends AIChatAgent<Env> {
           // work-item IDs, and dates before this handler writes the sprint row.
           needsApproval: true,
           execute: async ({ projectId, name, goal, capacityPoints, workItemIds, startDate, endDate }) => {
-            return this.log.withToolLogging("draftSprintPlan", async () => {
-              const missing = this.projectNotFound(projectId);
-              if (missing) throw new Error(missing.error);
-              const all = this.getWorkItems(projectId);
-              const candidates = all.map((item) => ({
-                id: item.id, title: item.title, estimatePoints: item.estimate_points,
-                status: item.status as "backlog" | "ready" | "in_progress" | "blocked" | "done",
-                dependencies: parseJson<string[]>(item.dependencies, [])
-              }));
-              const evaluation = evaluateSprintSelection(candidates, workItemIds, capacityPoints, candidates);
-              const normalizedStartDate = normalizeOptionalDate(startDate);
-              const normalizedEndDate = normalizeOptionalDate(endDate);
-              const id = newId("SP");
-              try {
-                this.sql`
-                  INSERT INTO sprints (id, project_id, name, goal, capacity_points, planned_points, work_item_ids, status, start_date, end_date, created_at)
-                  VALUES (${id}, ${projectId}, ${name}, ${goal}, ${capacityPoints}, ${evaluation.plannedPoints}, ${JSON.stringify(evaluation.selected.map((item) => item.id))}, 'draft', ${normalizedStartDate}, ${normalizedEndDate}, ${new Date().toISOString()})
-                `;
-              } catch (error) {
-                this.log.error("draftSprintPlan INSERT failed", error instanceof Error ? error : new Error(String(error)), { projectId, sprintId: id });
-                throw new Error(`Sprint plan save failed: ${error instanceof Error ? error.message : String(error)}`);
-              }
-              this.log.approval({ toolName: "draftSprintPlan", action: "completed", projectId, message: `Sprint ${name} created as draft` });
-              return {
-                id, projectId, name, goal, status: "draft", capacityPoints,
-                plannedPoints: evaluation.plannedPoints, remainingCapacity: evaluation.remainingCapacity,
-                overCapacity: evaluation.overCapacity, overBy: evaluation.overBy,
-                selectedItems: evaluation.selected.map((item) => ({ id: item.id, title: item.title, estimatePoints: item.estimatePoints, status: item.status })),
-                completedItemsExcluded: evaluation.completedWorkItemIds,
-                unestimatedWorkItemIds: evaluation.unestimatedWorkItemIds,
-                dependencyWarnings: evaluation.dependencyWarnings,
-                unknownWorkItemIds: evaluation.unknownWorkItemIds,
-                startDate: normalizedStartDate, endDate: normalizedEndDate, persisted: true
-              };
-            }, { input: { projectId, name, goal, capacityPoints, workItemIds, startDate, endDate } });
+            const missing = this.projectNotFound(projectId);
+            if (missing) throw new Error(missing.error);
+            const all = this.getWorkItems(projectId);
+            const candidates = all.map((item) => ({
+              id: item.id, title: item.title, estimatePoints: item.estimate_points,
+              status: item.status as "backlog" | "ready" | "in_progress" | "blocked" | "done",
+              dependencies: parseJson<string[]>(item.dependencies, [])
+            }));
+            const evaluation = evaluateSprintSelection(candidates, workItemIds, capacityPoints, candidates);
+            const normalizedStartDate = normalizeOptionalDate(startDate);
+            const normalizedEndDate = normalizeOptionalDate(endDate);
+            const id = newId("SP");
+            try {
+              this.sql`
+                INSERT INTO sprints (id, project_id, name, goal, capacity_points, planned_points, work_item_ids, status, start_date, end_date, created_at)
+                VALUES (${id}, ${projectId}, ${name}, ${goal}, ${capacityPoints}, ${evaluation.plannedPoints}, ${JSON.stringify(evaluation.selected.map((item) => item.id))}, 'draft', ${normalizedStartDate}, ${normalizedEndDate}, ${new Date().toISOString()})
+              `;
+            } catch (error) {
+              console.error("[ProjectPilot] draftSprintPlan failed", error);
+              throw new Error(`Sprint plan save failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+            return {
+              id, projectId, name, goal, status: "draft", capacityPoints,
+              plannedPoints: evaluation.plannedPoints, remainingCapacity: evaluation.remainingCapacity,
+              overCapacity: evaluation.overCapacity, overBy: evaluation.overBy,
+              selectedItems: evaluation.selected.map((item) => ({ id: item.id, title: item.title, estimatePoints: item.estimatePoints, status: item.status })),
+              completedItemsExcluded: evaluation.completedWorkItemIds,
+              unestimatedWorkItemIds: evaluation.unestimatedWorkItemIds,
+              dependencyWarnings: evaluation.dependencyWarnings,
+              unknownWorkItemIds: evaluation.unknownWorkItemIds,
+              startDate: normalizedStartDate, endDate: normalizedEndDate, persisted: true
+            };
           }
         })
       },
       // Bound the agent loop so one request cannot make unlimited model/tool steps.
-      // The model can still perform multiple tool calls, up to this cap.
-      stopWhen: stepCountIs(20),
-      abortSignal: options?.abortSignal,
-      // Secret for HMAC-signing tool approval requests. Required for the approval
-      // flow to work with @cloudflare/ai-chat client.
-      experimental_toolApprovalSecret: approvalSecret,
-      onFinish: async (event: Record<string, unknown>) => {
-        if (event.error) {
-          this.log.error("Agent stream failed", event.error as Error, { workspaceId });
-        } else {
-          this.log.debug("Agent stream completed", { workspaceId, usage: event.usage });
-        }
-      }
+      // The model can still perform multiple tool calls, up to this eight-step cap.
+      stopWhen: stepCountIs(8),
+      abortSignal: options?.abortSignal
     });
 
     return result.toUIMessageStreamResponse();

@@ -81,7 +81,7 @@ test("typed prompts carry the selected project context into the agent conversati
 test("saved backlog and sprint writes trigger a read-after-write workspace refresh", () => {
   assert.match(app, /rawState !== "output-available" && normalizedState !== "complete"/);
   assert.match(app, /\["createProject", "createBacklogItems", "draftSprintPlan"\]/);
-  assert.match(app, /void refreshBoard\(targetProjectId, preferredSprintId, true\)/);
+  assert.match(app, /void refreshBoard\(targetProjectId, preferredSprintId\)/);
   assert.match(app, /onTurnEnd: \(\{ outcome, error \}\)/);
   assert.match(app, /processCompletedWriteMessages\(latestMessagesRef\.current\)/);
   assert.match(app, /setActiveTab\("backlog"\)/);
